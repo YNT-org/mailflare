@@ -1,2 +1,7 @@
 /_next/static/*
   Cache-Control: public,max-age=31536000,immutable
+
+/bimi/ynt.svg
+  Content-Type: image/svg+xml
+  X-Content-Type-Options: nosniff
+  Cache-Control: public,max-age=3600
