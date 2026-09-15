@@ -5,10 +5,12 @@ import type {
 	CfSendingSubdomain,
 } from "@/lib/cloudflare-api.types";
 import {
+	CloudflareApiError,
 	formatCloudflareError,
 	getCloudflareAuth,
 	getCloudflareAuthHeaders,
 	getCloudflareAuthHint,
+	getCloudflareTokenDiagnostic,
 	getEmailWorkerName,
 } from "@/lib/cloudflare-api-utils";
 import { getZoneLookupCandidates } from "@/lib/domains/utils";
@@ -28,11 +30,24 @@ export async function cfRequest<T>(
 			...(init?.headers ?? {}),
 		},
 	});
-	const json = (await res.json()) as CfResponse<T>;
+	let json: CfResponse<T> | undefined;
+	try {
+		json = (await res.json()) as CfResponse<T>;
+	} finally {
+		console.info("Cloudflare API request", {
+			...getCloudflareTokenDiagnostic(env),
+			endpoint: path.split("?")[0],
+			method: init?.method ?? "GET",
+			status: res.status,
+			errorCodes: (json?.errors ?? []).map((error) => error.code).filter((code) => typeof code === "number"),
+		});
+	}
 
 	if (!json.success) {
-		throw new Error(
+		throw new CloudflareApiError(
 			`${formatCloudflareError(path, res.status, res.statusText, json.errors ?? [])}${getCloudflareAuthHint(json.errors ?? [])}`,
+			res.status,
+			(json.errors ?? []).map((error) => error.code).filter((code): code is number => typeof code === "number"),
 		);
 	}
 	return json.result;
@@ -150,10 +165,16 @@ export async function getEmailRoutingSettings(
 }
 
 export async function listEmailRoutingRules(env: CloudflareEnv, zoneId: string) {
-	return cfRequest<CfEmailRoutingRule[]>(
-		env,
-		`/zones/${zoneId}/email/routing/rules`,
-	);
+	const rules: CfEmailRoutingRule[] = [];
+	const perPage = 50;
+	for (let page = 1; ; page++) {
+		const batch = await cfRequest<CfEmailRoutingRule[]>(
+			env,
+			`/zones/${zoneId}/email/routing/rules?page=${page}&per_page=${perPage}`,
+		);
+		rules.push(...batch);
+		if (batch.length < perPage) return rules;
+	}
 }
 
 export async function deleteEmailRoutingRule(
@@ -189,49 +210,72 @@ export async function createEmailRoutingRuleToWorker(
 	);
 }
 
+function routesAddress(rule: CfEmailRoutingRule, normalizedAddress: string): boolean {
+	return Boolean(rule.matchers?.some(
+		(matcher) => matcher.type === "literal" && matcher.field === "to" && matcher.value?.trim().toLowerCase() === normalizedAddress,
+	));
+}
+
 function isWorkerRouteForAddress(
 	rule: CfEmailRoutingRule,
 	normalizedAddress: string,
 	workerName: string,
 ): boolean {
-	const routesAddress = rule.matchers?.some(
-		(matcher) => matcher.type === "literal" && matcher.field === "to" && matcher.value?.toLowerCase() === normalizedAddress,
+	const sendsToWorker = rule.actions?.length === 1 && rule.actions.every(
+		(action) => action.type === "worker" && action.value?.length === 1 && action.value[0] === workerName,
 	);
-	const sendsToWorker = rule.actions?.some(
-		(action) => action.type === "worker" && (action.value?.length ? action.value.includes(workerName) : true),
-	);
-	return Boolean(routesAddress && sendsToWorker);
+	return Boolean(routesAddress(rule, normalizedAddress) && sendsToWorker);
 }
 
 export async function ensureEmailRoutingRuleToWorker(
 	env: CloudflareEnv,
 	zoneId: string,
 	address: string,
+	options?: {
+		onCreated?: (rule: CfEmailRoutingRule) => void;
+		onUpdated?: (previous: CfEmailRoutingRule) => void;
+	},
 ) {
-	const normalized = address.toLowerCase();
+	const normalized = address.trim().toLowerCase();
 	const workerName = getEmailWorkerName();
-	const rules = await listEmailRoutingRules(env, zoneId);
-	const existing = rules.find((rule) => isWorkerRouteForAddress(rule, normalized, workerName));
-
-	if (existing?.enabled) return existing;
-	if (existing?.id) {
-		return cfRequest<CfEmailRoutingRule>(
+	async function reconcile(existing: CfEmailRoutingRule) {
+		if (existing.enabled && isWorkerRouteForAddress(existing, normalized, workerName)) return existing;
+		const ruleId = existing.id ?? existing.tag;
+		if (!ruleId) throw new Error(`The existing Email Routing rule for ${normalized} has no identifier; it was preserved.`);
+		const updated = await cfRequest<CfEmailRoutingRule>(
 			env,
-			`/zones/${zoneId}/email/routing/rules/${existing.id}`,
+			`/zones/${zoneId}/email/routing/rules/${ruleId}`,
 			{
 				method: "PUT",
 				body: JSON.stringify({
 					actions: [{ type: "worker", value: [workerName] }],
 					enabled: true,
-					matchers: [{ type: "literal", field: "to", value: normalized }],
+					matchers: existing.matchers,
 					name: existing.name ?? `Route ${normalized} to ${workerName}`,
 					priority: existing.priority,
 				}),
 			},
 		);
+		options?.onUpdated?.(existing);
+		return updated;
 	}
 
-	return createEmailRoutingRuleToWorker(env, zoneId, normalized);
+	const rules = await listEmailRoutingRules(env, zoneId);
+	const existing = rules.find((rule) => routesAddress(rule, normalized));
+	if (existing) return reconcile(existing);
+
+	let created: CfEmailRoutingRule;
+	try {
+		created = await createEmailRoutingRuleToWorker(env, zoneId, normalized);
+	} catch (error) {
+		// A concurrent ensure may have created the address since our GET.
+		if (!(error instanceof CloudflareApiError) || error.status !== 409 || !error.errorCodes.includes(2014)) throw error;
+		const current = (await listEmailRoutingRules(env, zoneId)).find((rule) => routesAddress(rule, normalized));
+		if (current) return reconcile(current);
+		throw error;
+	}
+	options?.onCreated?.(created);
+	return created;
 }
 
 export async function deleteEmailRoutingRuleForAddress(
@@ -239,11 +283,12 @@ export async function deleteEmailRoutingRuleForAddress(
 	zoneId: string,
 	address: string,
 ): Promise<boolean> {
-	const normalized = address.toLowerCase();
+	const normalized = address.trim().toLowerCase();
 	const workerName = getEmailWorkerName();
 	const rules = await listEmailRoutingRules(env, zoneId);
 	const existing = rules.find((rule) => isWorkerRouteForAddress(rule, normalized, workerName));
-	if (!existing?.id) return false;
-	await deleteEmailRoutingRule(env, zoneId, existing.id);
+	const ruleId = existing?.id ?? existing?.tag;
+	if (!ruleId) return false;
+	await deleteEmailRoutingRule(env, zoneId, ruleId);
 	return true;
 }

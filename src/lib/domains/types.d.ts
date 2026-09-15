@@ -18,6 +18,8 @@ export type DomainProvisioningChanges = {
 	previousCatchAll: CfEmailRoutingRule | null;
 	/** Addresses this attempt pointed at the Worker, filled in as they are created. */
 	createdAddressRules: string[];
+	/** Existing address rules changed by this attempt, for restoration on failure. */
+	updatedAddressRules: CfEmailRoutingRule[];
 };
 
 export type DomainProvisioningResult = {

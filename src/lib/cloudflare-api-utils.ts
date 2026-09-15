@@ -1,5 +1,11 @@
 import type { CfApiError, CfAuth } from "@/lib/cloudflare-api.types";
 
+export class CloudflareApiError extends Error {
+	constructor(message: string, public status: number, public errorCodes: number[]) {
+		super(message);
+	}
+}
+
 export function getCloudflareAuth(env: CloudflareEnv): CfAuth {
 	const token = env.CF_TOKEN?.trim();
 	const key = env.CF_API_KEY?.trim();
@@ -18,6 +24,18 @@ export function getCloudflareAuth(env: CloudflareEnv): CfAuth {
 	}
 
 	throw new Error("CF_TOKEN or CF_API_KEY is not configured");
+}
+
+export function getCloudflareTokenDiagnostic(env: CloudflareEnv) {
+	const raw = env.CF_TOKEN ?? "";
+	const token = raw.trim();
+	return {
+		tokenExists: env.CF_TOKEN !== undefined && env.CF_TOKEN !== null,
+		// Fixed labels only: never log an arbitrary slice of a secret.
+		tokenType: token.startsWith("cfut_") ? "cfut_" : token ? "other" : "empty",
+		tokenLength: raw.length,
+		tokenHasWhitespace: /\s/.test(raw),
+	};
 }
 
 export function getCloudflareAuthHeaders(auth: CfAuth): HeadersInit {

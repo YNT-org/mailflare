@@ -73,8 +73,10 @@ export async function POST(request: Request) {
 		});
 		const domain = added.domain;
 		changes = added.changes;
-		await ensureEmailRoutingRuleToWorker(env, domain.zoneId, email);
-		changes.createdAddressRules.push(email);
+		await ensureEmailRoutingRuleToWorker(env, domain.zoneId, email, {
+			onCreated: () => added.changes.createdAddressRules.push(email),
+			onUpdated: (previous) => added.changes.updatedAddressRules.push(previous),
+		});
 		const mailboxId = newId("mbx");
 		await db.insert(mailboxes).values({
 			id: mailboxId,

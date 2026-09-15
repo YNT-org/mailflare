@@ -1,4 +1,5 @@
 import {
+	cfRequest,
 	deleteEmailRoutingRuleForAddress,
 	deleteSendingSubdomain,
 	disableEmailRouting,
@@ -32,6 +33,23 @@ export async function rollbackDomainProvisioning(
 	for (const address of changes.createdAddressRules) {
 		await attempt(`deleteEmailRoutingRuleForAddress ${address}`, () =>
 			deleteEmailRoutingRuleForAddress(env, zoneId, address),
+		);
+	}
+
+	for (const previous of [...changes.updatedAddressRules].reverse()) {
+		const ruleId = previous.id ?? previous.tag;
+		if (!ruleId) continue;
+		await attempt("restoreEmailRoutingRule", () =>
+			cfRequest(env, `/zones/${zoneId}/email/routing/rules/${ruleId}`, {
+				method: "PUT",
+				body: JSON.stringify({
+					actions: previous.actions,
+					enabled: previous.enabled,
+					matchers: previous.matchers,
+					name: previous.name,
+					priority: previous.priority,
+				}),
+			}),
 		);
 	}
 

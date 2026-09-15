@@ -38,6 +38,7 @@ export async function provisionDomainOnCloudflare(
 		createdSendingSubdomainTag: null,
 		previousCatchAll: null,
 		createdAddressRules: [],
+		updatedAddressRules: [],
 	};
 
 	if (enableRouting) {
